@@ -20,6 +20,14 @@ Parameters:
   GitHubBranch:
     Type: String
     Default: main
+  GitHubOwnerId:
+    Type: String
+    Default: '193885820'
+    Description: Numeric GitHub owner ID (immutable OIDC subject claim)
+  GitHubAppRepoId:
+    Type: String
+    Default: '1405703213'
+    Description: Numeric GitHub repository ID (immutable OIDC subject claim)
   GitHubOidcProviderArn:
     Type: String
     Default: ''
@@ -107,7 +115,12 @@ Resources:
             Condition:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
-                token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubOrg}/${GitHubAppRepo}:ref:refs/heads/${GitHubBranch}'
+                # GitHub issues immutable subjects (owner@id/repo@id) for this repo; the
+                # numeric IDs stop a deleted-and-recreated repo with the same name from
+                # assuming the role. The legacy name-only form is kept for compatibility.
+                token.actions.githubusercontent.com:sub:
+                  - !Sub 'repo:${GitHubOrg}@${GitHubOwnerId}/${GitHubAppRepo}@${GitHubAppRepoId}:ref:refs/heads/${GitHubBranch}'
+                  - !Sub 'repo:${GitHubOrg}/${GitHubAppRepo}:ref:refs/heads/${GitHubBranch}'
       Policies:
         - PolicyName: ecr-push-and-deploy-bundle
           PolicyDocument:

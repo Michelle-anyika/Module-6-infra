@@ -5,6 +5,8 @@ parameters:
   GitHubOrg: Michelle-anyika
   GitHubAppRepo: Module-6-app
   GitHubBranch: main
+  GitHubOwnerId: '193885820'
+  GitHubAppRepoId: '1405703213'
   GitHubOidcProviderArn: arn:aws:iam::615299752577:oidc-provider/token.actions.githubusercontent.com
 tags:
   Project: module-6
