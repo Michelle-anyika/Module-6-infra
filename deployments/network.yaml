@@ -1,0 +1,11 @@
+template-file-path: templates/network.yaml
+parameters:
+  ProjectName: module-6
+  Environment: dev
+  VpcCidr: 10.0.0.0/16
+tags:
+  Project: module-6
+  Environment: dev
+  Owner: Michelle-anyika
+  ManagedBy: CloudFormation
+  CostCenter: aws-labs

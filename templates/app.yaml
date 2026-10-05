@@ -1,0 +1,484 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Module 6 - compute and delivery. ECS Fargate service in private app
+  subnets behind a public ALB, CPU target-tracking auto scaling (1-4 tasks),
+  CodeDeploy blue/green, and a CodePipeline started by an EventBridge rule
+  on every ECR image push.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: module-6
+  Environment:
+    Type: String
+    Default: dev
+  NetworkStackName:
+    Type: String
+    Default: module-6-network
+  DataStackName:
+    Type: String
+    Default: module-6-data
+  CicdStackName:
+    Type: String
+    Default: module-6-cicd
+  ImageTag:
+    Type: String
+    Default: latest
+    Description: Image used for the initial task definition only; later releases come from CodePipeline.
+  TriggerImageTag:
+    Type: String
+    Default: latest
+    Description: Tag whose push starts the pipeline (CI pushes the SHA tag first, then this one).
+  TaskCpu:
+    Type: String
+    Default: '512'
+  TaskMemory:
+    Type: String
+    Default: '1024'
+  MinTasks:
+    Type: Number
+    Default: 1
+  DesiredTasks:
+    Type: Number
+    Default: 1
+  MaxTasks:
+    Type: Number
+    Default: 4
+  CpuTargetPercent:
+    Type: Number
+    Default: 60
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+
+Resources:
+  # ------------------------------------------------------------ Logging
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}-${Environment}-app'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ---------------------------------------------------------------- IAM
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-ecs-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-redis-auth-secret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !ImportValue { 'Fn::Sub': '${DataStackName}-RedisAuthSecretArn' }
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-ecs-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: rds-proxy-iam-auth
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: rds-db:connect
+                Resource: !Sub
+                  - 'arn:aws:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${ProxyId}/${DbUser}'
+                  - ProxyId: !ImportValue { 'Fn::Sub': '${DataStackName}-DbProxyResourceId' }
+                    DbUser: !ImportValue { 'Fn::Sub': '${DataStackName}-DbUsername' }
+
+  # ---------------------------------------------------------------- ALB
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-alb'
+      Type: application
+      Scheme: internet-facing
+      Subnets: !Split [',', !ImportValue { 'Fn::Sub': '${NetworkStackName}-PublicSubnetIds' }]
+      SecurityGroups:
+        - !ImportValue { 'Fn::Sub': '${NetworkStackName}-AlbSecurityGroupId' }
+      LoadBalancerAttributes:
+        - { Key: routing.http.drop_invalid_header_fields.enabled, Value: 'true' }
+        - { Key: idle_timeout.timeout_seconds, Value: '60' }
+
+  BlueTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-blue'
+      VpcId: !ImportValue { 'Fn::Sub': '${NetworkStackName}-VpcId' }
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: '200' }
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: '30' }
+
+  GreenTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-green'
+      VpcId: !ImportValue { 'Fn::Sub': '${NetworkStackName}-VpcId' }
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: '200' }
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: '30' }
+
+  ProdListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref BlueTargetGroup
+
+  TestListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTP
+      Port: 8080
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref BlueTargetGroup
+
+  # ---------------------------------------------------------------- ECS
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ProjectName}-${Environment}-cluster'
+      CapacityProviders: [FARGATE]
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+      ClusterSettings:
+        - Name: containerInsights
+          Value: disabled  # cost: app logs + ECS service metrics are enough for this lab
+
+  # Initial revision only. After creation CodePipeline/CodeDeploy registers
+  # new revisions from ecs/taskdef.json in the app repo.
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${Environment}-app'
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Sub
+            - '${RepoUri}:${ImageTag}'
+            - RepoUri: !ImportValue { 'Fn::Sub': '${CicdStackName}-EcrRepositoryUri' }
+          Essential: true
+          PortMappings:
+            - { ContainerPort: 8080, Protocol: tcp }
+          Environment:
+            - { Name: APP_VERSION, Value: !Ref ImageTag }
+            - { Name: DB_IAM_AUTH, Value: 'true' }
+            - { Name: DB_HOST, Value: !ImportValue { 'Fn::Sub': '${DataStackName}-DbProxyEndpoint' } }
+            - { Name: DB_PORT, Value: '5432' }
+            - { Name: DB_NAME, Value: !ImportValue { 'Fn::Sub': '${DataStackName}-DbName' } }
+            - { Name: DB_USER, Value: !ImportValue { 'Fn::Sub': '${DataStackName}-DbUsername' } }
+            - { Name: REDIS_HOST, Value: !ImportValue { 'Fn::Sub': '${DataStackName}-RedisPrimaryEndpoint' } }
+            - { Name: REDIS_PORT, Value: '6379' }
+            - { Name: REDIS_SSL, Value: 'true' }
+          Secrets:
+            - Name: REDIS_PASSWORD
+              ValueFrom: !Sub
+                - '${SecretArn}:password::'
+                - SecretArn: !ImportValue { 'Fn::Sub': '${DataStackName}-RedisAuthSecretArn' }
+          HealthCheck:
+            Command: ['CMD-SHELL', 'wget -qO- http://localhost:8080/health || exit 1']
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 90
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: app
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: [ProdListener, TestListener]
+    Properties:
+      ServiceName: !Sub '${ProjectName}-${Environment}-service'
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredTasks
+      DeploymentController: { Type: CODE_DEPLOY }
+      HealthCheckGracePeriodSeconds: 120
+      EnableECSManagedTags: true
+      PropagateTags: SERVICE
+      LoadBalancers:
+        - ContainerName: app
+          ContainerPort: 8080
+          TargetGroupArn: !Ref BlueTargetGroup
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Split [',', !ImportValue { 'Fn::Sub': '${NetworkStackName}-AppSubnetIds' }]
+          SecurityGroups:
+            - !ImportValue { 'Fn::Sub': '${NetworkStackName}-EcsSecurityGroupId' }
+
+  # -------------------------------------------------------- Auto scaling
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub 'service/${Cluster}/${Service.Name}'
+      MinCapacity: !Ref MinTasks
+      MaxCapacity: !Ref MaxTasks
+
+  CpuScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-${Environment}-cpu-target-tracking'
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: !Ref CpuTargetPercent
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 180
+
+  # ---------------------------------------------------------- CodeDeploy
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-codedeploy-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codedeploy.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS
+
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub '${ProjectName}-${Environment}-app'
+      ComputePlatform: ECS
+
+  DeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      DeploymentGroupName: !Sub '${ProjectName}-${Environment}-dg'
+      ServiceRoleArn: !GetAtt CodeDeployRole.Arn
+      DeploymentConfigName: CodeDeployDefault.ECSAllAtOnce
+      DeploymentStyle:
+        DeploymentType: BLUE_GREEN
+        DeploymentOption: WITH_TRAFFIC_CONTROL
+      BlueGreenDeploymentConfiguration:
+        DeploymentReadyOption:
+          ActionOnTimeout: CONTINUE_DEPLOYMENT
+        TerminateBlueInstancesOnDeploymentSuccess:
+          Action: TERMINATE
+          TerminationWaitTimeInMinutes: 5
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events: [DEPLOYMENT_FAILURE, DEPLOYMENT_STOP_ON_REQUEST]
+      ECSServices:
+        - ClusterName: !Ref Cluster
+          ServiceName: !GetAtt Service.Name
+      LoadBalancerInfo:
+        TargetGroupPairInfoList:
+          - ProdTrafficRoute:
+              ListenerArns: [!Ref ProdListener]
+            TestTrafficRoute:
+              ListenerArns: [!Ref TestListener]
+            TargetGroups:
+              - Name: !GetAtt BlueTargetGroup.TargetGroupName
+              - Name: !GetAtt GreenTargetGroup.TargetGroupName
+
+  # ---------------------------------------------------------- Pipeline
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-codepipeline-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codepipeline.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: pipeline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject, s3:GetBucketVersioning, s3:GetBucketLocation, s3:ListBucket]
+                Resource:
+                  - !ImportValue { 'Fn::Sub': '${CicdStackName}-ArtifactBucketArn' }
+                  - !Sub
+                    - '${BucketArn}/*'
+                    - BucketArn: !ImportValue { 'Fn::Sub': '${CicdStackName}-ArtifactBucketArn' }
+              - Effect: Allow
+                Action: [ecr:DescribeImages]
+                Resource: !ImportValue { 'Fn::Sub': '${CicdStackName}-EcrRepositoryArn' }
+              - Effect: Allow
+                Action:
+                  - codedeploy:CreateDeployment
+                  - codedeploy:GetApplication
+                  - codedeploy:GetApplicationRevision
+                  - codedeploy:GetDeployment
+                  - codedeploy:GetDeploymentConfig
+                  - codedeploy:RegisterApplicationRevision
+                Resource:
+                  - !Sub 'arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:application:${CodeDeployApplication}'
+                  - !Sub 'arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentgroup:${CodeDeployApplication}/*'
+                  - !Sub 'arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentconfig:*'
+              - Effect: Allow
+                Action: [ecs:RegisterTaskDefinition, ecs:TagResource]
+                Resource: '*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: [!GetAtt TaskExecutionRole.Arn, !GetAtt TaskRole.Arn]
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-pipeline'
+      PipelineType: V2
+      ExecutionMode: QUEUED
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !ImportValue { 'Fn::Sub': '${CicdStackName}-ArtifactBucketName' }
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Image
+              ActionTypeId: { Category: Source, Owner: AWS, Provider: ECR, Version: '1' }
+              Configuration:
+                RepositoryName: !ImportValue { 'Fn::Sub': '${CicdStackName}-EcrRepositoryName' }
+                ImageTag: !Ref TriggerImageTag
+              OutputArtifacts: [{ Name: ImageArtifact }]
+            - Name: DeployBundle
+              ActionTypeId: { Category: Source, Owner: AWS, Provider: S3, Version: '1' }
+              Configuration:
+                S3Bucket: !ImportValue { 'Fn::Sub': '${CicdStackName}-ArtifactBucketName' }
+                S3ObjectKey: deploy/bundle.zip
+                PollForSourceChanges: false
+              OutputArtifacts: [{ Name: BundleArtifact }]
+        - Name: Deploy
+          Actions:
+            - Name: BlueGreen
+              ActionTypeId: { Category: Deploy, Owner: AWS, Provider: CodeDeployToECS, Version: '1' }
+              InputArtifacts: [{ Name: ImageArtifact }, { Name: BundleArtifact }]
+              Configuration:
+                ApplicationName: !Ref CodeDeployApplication
+                DeploymentGroupName: !Ref DeploymentGroup
+                TaskDefinitionTemplateArtifact: BundleArtifact
+                TaskDefinitionTemplatePath: taskdef.json
+                AppSpecTemplateArtifact: BundleArtifact
+                AppSpecTemplatePath: appspec.yaml
+                Image1ArtifactName: ImageArtifact
+                Image1ContainerName: IMAGE1_NAME
+
+  # --------------------------------------------------------- EventBridge
+  EventsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-events-pipeline-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: start-pipeline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource: !Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}'
+
+  EcrPushRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-ecr-push'
+      Description: Start the deployment pipeline when a new image is pushed to ECR
+      State: ENABLED
+      EventPattern:
+        source: [aws.ecr]
+        detail-type: [ECR Image Action]
+        detail:
+          action-type: [PUSH]
+          result: [SUCCESS]
+          repository-name:
+            - !ImportValue { 'Fn::Sub': '${CicdStackName}-EcrRepositoryName' }
+          image-tag: [!Ref TriggerImageTag]
+      Targets:
+        - Id: pipeline
+          Arn: !Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}'
+          RoleArn: !GetAtt EventsRole.Arn
+
+Outputs:
+  AlbUrl:
+    Value: !Sub 'http://${LoadBalancer.DNSName}'
+  AlbTestUrl:
+    Description: CodeDeploy test listener (green tasks during a deployment)
+    Value: !Sub 'http://${LoadBalancer.DNSName}:8080'
+  ClusterName:
+    Value: !Ref Cluster
+  ServiceName:
+    Value: !GetAtt Service.Name
+  PipelineName:
+    Value: !Ref Pipeline
+  LogGroupName:
+    Value: !Ref LogGroup
+  TaskExecutionRoleArn:
+    Value: !GetAtt TaskExecutionRole.Arn
+  TaskRoleArn:
+    Value: !GetAtt TaskRole.Arn

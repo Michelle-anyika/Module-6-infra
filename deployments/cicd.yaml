@@ -1,0 +1,14 @@
+template-file-path: templates/cicd.yaml
+parameters:
+  ProjectName: module-6
+  Environment: dev
+  GitHubOrg: Michelle-anyika
+  GitHubAppRepo: Module-6-app
+  GitHubBranch: main
+  GitHubOidcProviderArn: arn:aws:iam::615299752577:oidc-provider/token.actions.githubusercontent.com
+tags:
+  Project: module-6
+  Environment: dev
+  Owner: Michelle-anyika
+  ManagedBy: CloudFormation
+  CostCenter: aws-labs

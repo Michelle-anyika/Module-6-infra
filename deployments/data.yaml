@@ -1,0 +1,15 @@
+template-file-path: templates/data.yaml
+parameters:
+  ProjectName: module-6
+  Environment: dev
+  NetworkStackName: module-6-network
+  DbInstanceClass: db.t3.micro
+  DbMultiAZ: 'false'
+  CacheNodeType: cache.t3.micro
+  CacheNodes: '2'
+tags:
+  Project: module-6
+  Environment: dev
+  Owner: Michelle-anyika
+  ManagedBy: CloudFormation
+  CostCenter: aws-labs

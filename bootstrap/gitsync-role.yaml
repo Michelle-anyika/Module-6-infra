@@ -1,0 +1,105 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Module 6 - bootstrap (deployed once from the CLI, not via Git sync). IAM role
+  that CloudFormation Git sync assumes to create/update the module-6-* stacks
+  from the deployment files in this repository.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: module-6
+
+Resources:
+  GitSyncRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-cfn-gitsync-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudformation.sync.codeconnections.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: gitsync-control
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SyncToCloudFormation
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStacks
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:GetTemplate
+                  - cloudformation:ListChangeSets
+                  - cloudformation:ListStacks
+                  - cloudformation:ValidateTemplate
+                Resource: '*'
+              - Sid: GitSyncEventRule
+                Effect: Allow
+                Action: [events:PutRule, events:PutTargets]
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    events:source: aws.cloudformation
+              - Sid: GitSyncEventRuleRead
+                Effect: Allow
+                Action: [events:DescribeRule, events:ListTargetsByRule]
+                Resource: '*'
+        # CloudFormation runs the change sets with this role's credentials, so
+        # it needs the services the module-6 templates manage. Scoped to those
+        # services; IAM is limited to module-6 roles.
+        - PolicyName: module-6-stack-resources
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:*
+                  - ecs:*
+                  - ecr:*
+                  - elasticloadbalancing:*
+                  - application-autoscaling:*
+                  - cloudwatch:*
+                  - logs:*
+                  - rds:*
+                  - elasticache:*
+                  - secretsmanager:*
+                  - kms:DescribeKey
+                  - kms:CreateGrant
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - codedeploy:*
+                  - codepipeline:*
+                  - events:*
+                  - s3:*
+                  - iam:GetRole
+                  - iam:ListRoles
+                  - iam:GetOpenIDConnectProvider
+                  - iam:CreateServiceLinkedRole
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:UpdateRole
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:PassRole
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-*'
+
+Outputs:
+  GitSyncRoleArn:
+    Value: !GetAtt GitSyncRole.Arn

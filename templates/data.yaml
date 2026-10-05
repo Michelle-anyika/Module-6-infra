@@ -1,0 +1,200 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Module 6 - data layer. RDS PostgreSQL (db.t3) in dedicated DB subnets,
+  RDS Proxy in dedicated proxy subnets (IAM auth + TLS required, RDS-managed
+  master secret), and ElastiCache Redis (TLS, at-rest encryption, AUTH token)
+  in dedicated cache subnets.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: module-6
+  Environment:
+    Type: String
+    Default: dev
+  NetworkStackName:
+    Type: String
+    Default: module-6-network
+  DbInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedPattern: '^db\.t3\..+$'
+    ConstraintDescription: Must be a db.t3 family instance class.
+  DbEngineVersion:
+    Type: String
+    Default: '16.9'
+  DbName:
+    Type: String
+    Default: module6
+  DbMasterUsername:
+    Type: String
+    Default: module6admin
+  DbMultiAZ:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Standby replica in a second AZ. Off by default to keep lab cost down.
+  CacheNodeType:
+    Type: String
+    Default: cache.t3.micro
+  CacheNodes:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 3
+    Description: Primary + replicas. 2 or more enables Multi-AZ automatic failover.
+
+Conditions:
+  HasCacheReplicas: !Not [!Equals [!Ref CacheNodes, 1]]
+
+Resources:
+  # --------------------------------------------------------------- RDS
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Dedicated private subnets for RDS PostgreSQL
+      SubnetIds: !Split [',', !ImportValue { 'Fn::Sub': '${NetworkStackName}-DbSubnetIds' }]
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-${Environment}-postgres'
+      Engine: postgres
+      EngineVersion: !Ref DbEngineVersion
+      DBInstanceClass: !Ref DbInstanceClass
+      DBName: !Ref DbName
+      MasterUsername: !Ref DbMasterUsername
+      ManageMasterUserPassword: true
+      AllocatedStorage: '20'
+      StorageType: gp3
+      StorageEncrypted: true
+      MultiAZ: !Ref DbMultiAZ
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups:
+        - !ImportValue { 'Fn::Sub': '${NetworkStackName}-DbSecurityGroupId' }
+      BackupRetentionPeriod: 1
+      AutoMinorVersionUpgrade: true
+      DeletionProtection: false
+      EnablePerformanceInsights: false
+      CopyTagsToSnapshot: true
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-postgres' }
+
+  # ---------------------------------------------------------- RDS Proxy
+  ProxyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-rdsproxy-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: rds.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: read-db-secret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !GetAtt Database.MasterUserSecret.SecretArn
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'
+
+  DbProxy:
+    Type: AWS::RDS::DBProxy
+    Properties:
+      DBProxyName: !Sub '${ProjectName}-${Environment}-proxy'
+      EngineFamily: POSTGRESQL
+      RoleArn: !GetAtt ProxyRole.Arn
+      RequireTLS: true
+      IdleClientTimeout: 1800
+      Auth:
+        - AuthScheme: SECRETS
+          SecretArn: !GetAtt Database.MasterUserSecret.SecretArn
+          IAMAuth: REQUIRED
+      VpcSubnetIds: !Split [',', !ImportValue { 'Fn::Sub': '${NetworkStackName}-ProxySubnetIds' }]
+      VpcSecurityGroupIds:
+        - !ImportValue { 'Fn::Sub': '${NetworkStackName}-ProxySecurityGroupId' }
+
+  DbProxyTargetGroup:
+    Type: AWS::RDS::DBProxyTargetGroup
+    Properties:
+      DBProxyName: !Ref DbProxy
+      TargetGroupName: default
+      DBInstanceIdentifiers: [!Ref Database]
+      ConnectionPoolConfigurationInfo:
+        MaxConnectionsPercent: 90
+        MaxIdleConnectionsPercent: 50
+        ConnectionBorrowTimeout: 120
+
+  # -------------------------------------------------------- ElastiCache
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Dedicated private subnets for ElastiCache Redis
+      SubnetIds: !Split [',', !ImportValue { 'Fn::Sub': '${NetworkStackName}-CacheSubnetIds' }]
+
+  RedisAuthSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}/${Environment}/redis-auth'
+      Description: AUTH token for the ElastiCache Redis replication group
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"default"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+
+  Redis:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupId: !Sub '${ProjectName}-${Environment}-redis'
+      ReplicationGroupDescription: Read-through cache for the Module 6 app
+      Engine: redis
+      EngineVersion: '7.1'
+      CacheNodeType: !Ref CacheNodeType
+      NumCacheClusters: !Ref CacheNodes
+      AutomaticFailoverEnabled: !If [HasCacheReplicas, true, false]
+      MultiAZEnabled: !If [HasCacheReplicas, true, false]
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      SecurityGroupIds:
+        - !ImportValue { 'Fn::Sub': '${NetworkStackName}-CacheSecurityGroupId' }
+      TransitEncryptionEnabled: true
+      AtRestEncryptionEnabled: true
+      AuthToken: !Sub '{{resolve:secretsmanager:${RedisAuthSecret}::password}}'
+      SnapshotRetentionLimit: 0
+      AutoMinorVersionUpgrade: true
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-redis' }
+
+Outputs:
+  DbProxyEndpoint:
+    Value: !GetAtt DbProxy.Endpoint
+    Export: { Name: !Sub '${AWS::StackName}-DbProxyEndpoint' }
+  DbProxyResourceId:
+    Description: prx-... id used in the rds-db:connect IAM resource ARN
+    Value: !Select [6, !Split [':', !GetAtt DbProxy.DBProxyArn]]
+    Export: { Name: !Sub '${AWS::StackName}-DbProxyResourceId' }
+  DbName:
+    Value: !Ref DbName
+    Export: { Name: !Sub '${AWS::StackName}-DbName' }
+  DbUsername:
+    Value: !Ref DbMasterUsername
+    Export: { Name: !Sub '${AWS::StackName}-DbUsername' }
+  DbInstanceEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+  RedisPrimaryEndpoint:
+    Value: !GetAtt Redis.PrimaryEndPoint.Address
+    Export: { Name: !Sub '${AWS::StackName}-RedisPrimaryEndpoint' }
+  RedisAuthSecretArn:
+    Value: !Ref RedisAuthSecret
+    Export: { Name: !Sub '${AWS::StackName}-RedisAuthSecretArn' }

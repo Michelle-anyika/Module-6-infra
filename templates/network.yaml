@@ -1,0 +1,397 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Module 6 - network layer. Multi-AZ VPC with dedicated subnet tiers
+  (public/ALB, app/ECS, proxy/RDS Proxy, db/RDS, cache/ElastiCache), no NAT
+  gateway (private workloads reach AWS APIs through VPC endpoints), and one
+  least-privilege security group per resource type.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: module-6
+  Environment:
+    Type: String
+    Default: dev
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+
+Resources:
+  # ---------------------------------------------------------------- VPC
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-vpc' }
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-igw' }
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # ------------------------------------------------------------ Subnets
+  # Each tier gets /24 per AZ carved from the VPC CIDR (index * 256 hosts).
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 64, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-public-a' }
+        - { Key: Tier, Value: public }
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 64, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-public-b' }
+        - { Key: Tier, Value: public }
+
+  AppSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [10, !Cidr [!Ref VpcCidr, 64, 8]]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-app-a' }
+        - { Key: Tier, Value: app }
+  AppSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [11, !Cidr [!Ref VpcCidr, 64, 8]]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-app-b' }
+        - { Key: Tier, Value: app }
+
+  DbSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [20, !Cidr [!Ref VpcCidr, 64, 8]]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-db-a' }
+        - { Key: Tier, Value: db }
+  DbSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [21, !Cidr [!Ref VpcCidr, 64, 8]]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-db-b' }
+        - { Key: Tier, Value: db }
+
+  ProxySubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [30, !Cidr [!Ref VpcCidr, 64, 8]]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-proxy-a' }
+        - { Key: Tier, Value: proxy }
+  ProxySubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [31, !Cidr [!Ref VpcCidr, 64, 8]]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-proxy-b' }
+        - { Key: Tier, Value: proxy }
+
+  CacheSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [40, !Cidr [!Ref VpcCidr, 64, 8]]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-cache-a' }
+        - { Key: Tier, Value: cache }
+  CacheSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [41, !Cidr [!Ref VpcCidr, 64, 8]]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-cache-b' }
+        - { Key: Tier, Value: cache }
+
+  # ------------------------------------------------------- Route tables
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-public-rt' }
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnetARta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRouteTable }
+  PublicSubnetBRta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRouteTable }
+
+  # Private route table: local routes + S3 gateway endpoint only. No NAT.
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-private-rt' }
+  AppSubnetARta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref AppSubnetA, RouteTableId: !Ref PrivateRouteTable }
+  AppSubnetBRta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref AppSubnetB, RouteTableId: !Ref PrivateRouteTable }
+  DbSubnetARta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref DbSubnetA, RouteTableId: !Ref PrivateRouteTable }
+  DbSubnetBRta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref DbSubnetB, RouteTableId: !Ref PrivateRouteTable }
+  ProxySubnetARta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref ProxySubnetA, RouteTableId: !Ref PrivateRouteTable }
+  ProxySubnetBRta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref ProxySubnetB, RouteTableId: !Ref PrivateRouteTable }
+  CacheSubnetARta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref CacheSubnetA, RouteTableId: !Ref PrivateRouteTable }
+  CacheSubnetBRta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref CacheSubnetB, RouteTableId: !Ref PrivateRouteTable }
+
+  # ---------------------------------------------------- Security groups
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public ALB - HTTP prod (80) and blue/green test (8080) listeners
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0, Description: Prod listener }
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, CidrIp: 0.0.0.0/0, Description: CodeDeploy test listener }
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-alb-sg' }
+
+  EcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS Fargate tasks - app port from ALB only
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-ecs-sg' }
+
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Interface VPC endpoints - HTTPS from ECS tasks only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, SourceSecurityGroupId: !Ref EcsSecurityGroup, Description: HTTPS from ECS tasks }
+      SecurityGroupEgress:
+        - { IpProtocol: '-1', CidrIp: 127.0.0.1/32, Description: No egress }
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-vpce-sg' }
+
+  ProxySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS Proxy - PostgreSQL from ECS tasks only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref EcsSecurityGroup, Description: PostgreSQL from ECS tasks }
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-rdsproxy-sg' }
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS PostgreSQL - PostgreSQL from RDS Proxy only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref ProxySecurityGroup, Description: PostgreSQL from RDS Proxy }
+      SecurityGroupEgress:
+        - { IpProtocol: '-1', CidrIp: 127.0.0.1/32, Description: No egress }
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-rds-sg' }
+
+  CacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ElastiCache Redis - Redis TLS from ECS tasks only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 6379, ToPort: 6379, SourceSecurityGroupId: !Ref EcsSecurityGroup, Description: Redis from ECS tasks }
+      SecurityGroupEgress:
+        - { IpProtocol: '-1', CidrIp: 127.0.0.1/32, Description: No egress }
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-redis-sg' }
+
+  # Cross-references are separate resources to avoid circular dependencies.
+  AlbToEcsEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      DestinationSecurityGroupId: !Ref EcsSecurityGroup
+      Description: Forward to ECS tasks
+  EcsFromAlbIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EcsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Description: App port from ALB
+  # 443 egress covers interface endpoints and the S3 gateway endpoint
+  # (ECR layers). With no NAT/IGW route, nothing else is reachable.
+  EcsHttpsEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref EcsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+      Description: HTTPS to VPC endpoints (ECR, Logs, Secrets Manager, S3)
+  EcsToProxyEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref EcsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      DestinationSecurityGroupId: !Ref ProxySecurityGroup
+      Description: PostgreSQL to RDS Proxy
+  EcsToCacheEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref EcsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      DestinationSecurityGroupId: !Ref CacheSecurityGroup
+      Description: Redis to ElastiCache
+  ProxyToDbEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ProxySecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      DestinationSecurityGroupId: !Ref DbSecurityGroup
+      Description: PostgreSQL to RDS instance
+
+  # ------------------------------------------------------ VPC endpoints
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PrivateRouteTable]
+
+  EcrApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.api
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref AppSubnetA, !Ref AppSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+  EcrDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.dkr
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref AppSubnetA, !Ref AppSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.logs
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref AppSubnetA, !Ref AppSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.secretsmanager
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref AppSubnetA, !Ref AppSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+    Export: { Name: !Sub '${AWS::StackName}-VpcId' }
+  PublicSubnetIds:
+    Value: !Join [',', [!Ref PublicSubnetA, !Ref PublicSubnetB]]
+    Export: { Name: !Sub '${AWS::StackName}-PublicSubnetIds' }
+  AppSubnetIds:
+    Value: !Join [',', [!Ref AppSubnetA, !Ref AppSubnetB]]
+    Export: { Name: !Sub '${AWS::StackName}-AppSubnetIds' }
+  DbSubnetIds:
+    Value: !Join [',', [!Ref DbSubnetA, !Ref DbSubnetB]]
+    Export: { Name: !Sub '${AWS::StackName}-DbSubnetIds' }
+  ProxySubnetIds:
+    Value: !Join [',', [!Ref ProxySubnetA, !Ref ProxySubnetB]]
+    Export: { Name: !Sub '${AWS::StackName}-ProxySubnetIds' }
+  CacheSubnetIds:
+    Value: !Join [',', [!Ref CacheSubnetA, !Ref CacheSubnetB]]
+    Export: { Name: !Sub '${AWS::StackName}-CacheSubnetIds' }
+  AlbSecurityGroupId:
+    Value: !Ref AlbSecurityGroup
+    Export: { Name: !Sub '${AWS::StackName}-AlbSecurityGroupId' }
+  EcsSecurityGroupId:
+    Value: !Ref EcsSecurityGroup
+    Export: { Name: !Sub '${AWS::StackName}-EcsSecurityGroupId' }
+  ProxySecurityGroupId:
+    Value: !Ref ProxySecurityGroup
+    Export: { Name: !Sub '${AWS::StackName}-ProxySecurityGroupId' }
+  DbSecurityGroupId:
+    Value: !Ref DbSecurityGroup
+    Export: { Name: !Sub '${AWS::StackName}-DbSecurityGroupId' }
+  CacheSecurityGroupId:
+    Value: !Ref CacheSecurityGroup
+    Export: { Name: !Sub '${AWS::StackName}-CacheSecurityGroupId' }

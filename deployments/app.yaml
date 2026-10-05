@@ -1,0 +1,17 @@
+template-file-path: templates/app.yaml
+parameters:
+  ProjectName: module-6
+  Environment: dev
+  NetworkStackName: module-6-network
+  DataStackName: module-6-data
+  CicdStackName: module-6-cicd
+  MinTasks: '1'
+  DesiredTasks: '1'
+  MaxTasks: '4'
+  CpuTargetPercent: '60'
+tags:
+  Project: module-6
+  Environment: dev
+  Owner: Michelle-anyika
+  ManagedBy: CloudFormation
+  CostCenter: aws-labs
